@@ -1,12 +1,13 @@
 const express = require('express');
 const multer = require('multer');
 const XLSX = require('xlsx');
-const YahooFinance = require('yahoo-finance2');
-const yahooFinance = new YahooFinance();
-const path = require('path');
+const fetch = require('node-fetch'); // à installer si nécessaire
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Ta clé API Alpha Vantage (à mettre dans Render "Environment Variables")
+const ALPHA_VANTAGE_KEY = process.env.ALPHA_VANTAGE_KEY || 'demo'; // 'demo' pour test
 
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
@@ -39,6 +40,57 @@ function detectSector(name, ticker) {
   if (low.includes('lvmh') || low.includes('kering')) return 'Luxe';
   if (low.includes('capgemini') || low.includes('atos')) return 'Tech';
   return 'Autre';
+}
+
+// Récupère les cours via Yahoo Finance (simple, fiable)
+async function fetchPrice(ticker) {
+  const fullTicker = ticker + getSuffix(ticker);
+  const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${fullTicker}`;
+  try {
+    const res = await fetch(url);
+    const data = await res.json();
+    const quote = data?.quoteResponse?.result?.[0];
+    if (quote && quote.regularMarketPrice) {
+      return {
+        price: quote.regularMarketPrice,
+        changePercent: (quote.regularMarketPrice - (quote.regularMarketPreviousClose || quote.previousClose)) / (quote.regularMarketPreviousClose || quote.previousClose),
+        beta: quote.beta,
+        trailingPE: quote.trailingPE
+      };
+    }
+  } catch(e) {}
+  return null;
+}
+
+// Récupère les dividendes via Alpha Vantage (fiable)
+async function fetchDividendAlphaVantage(ticker) {
+  const fullTicker = ticker + getSuffix(ticker);
+  const url = `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${fullTicker}&apikey=${ALPHA_VANTAGE_KEY}`;
+  try {
+    // D'abord, on récupère le dividende annuel via l'overview
+    const overviewUrl = `https://www.alphavantage.co/query?function=OVERVIEW&symbol=${fullTicker}&apikey=${ALPHA_VANTAGE_KEY}`;
+    const overviewRes = await fetch(overviewUrl);
+    const overview = await overviewRes.json();
+    let annualDiv = parseFloat(overview.DividendPerShare) || 0;
+    let exDivDate = overview.DividendDate || null;
+
+    // Si pas trouvé, on tente l'endpoint "DIVIDENDS" (historique)
+    if (annualDiv === 0) {
+      const divUrl = `https://www.alphavantage.co/query?function=DIVIDENDS&symbol=${fullTicker}&apikey=${ALPHA_VANTAGE_KEY}`;
+      const divRes = await fetch(divUrl);
+      const divData = await divRes.json();
+      if (divData.data && divData.data.length > 0) {
+        // Le plus récent dividende
+        const lastDiv = divData.data[0];
+        annualDiv = parseFloat(lastDiv.amount) || 0;
+        exDivDate = lastDiv.ex_dividend_date || null;
+      }
+    }
+    return { annualDiv, exDivDate };
+  } catch(e) {
+    console.error(`Alpha Vantage error for ${ticker}:`, e.message);
+    return { annualDiv: 0, exDivDate: null };
+  }
 }
 
 app.post('/upload', upload.single('excel'), async (req, res) => {
@@ -105,47 +157,40 @@ app.post('/upload', upload.single('excel'), async (req, res) => {
     const enriched = [];
     for (let i = 0; i < portfolio.length; i++) {
       const p = portfolio[i];
-      const fullTicker = p.ticker + getSuffix(p.ticker);
-      try {
-        const quote = await yahooFinance.quote(fullTicker);
-        const realPrice = quote.regularMarketPrice || quote.currentPrice || p.cours;
-        const prevClose = quote.regularMarketPreviousClose || quote.previousClose;
-        const changePercent = prevClose ? (realPrice - prevClose) / prevClose : 0;
-
-        // Récupération des infos supplémentaires (dividendes, etc.)
-let annualDiv = 0, exDivDate = null, divYield = 0, beta = null, trailingPE = null;
-try {
-    // Récupère les modules nécessaires
-    const summary = await yahooFinance.quoteSummary(fullTicker, { modules: ['summaryDetail', 'defaultKeyStatistics'] });
-    if (summary.summaryDetail) {
-        annualDiv = summary.summaryDetail.trailingAnnualDividendRate || 0;
-        exDivDate = summary.summaryDetail.exDividendDate ? new Date(summary.summaryDetail.exDividendDate * 1000).toISOString().slice(0,10) : null;
-        divYield = summary.summaryDetail.dividendYield || (annualDiv && realPrice ? annualDiv / realPrice : 0);
-        beta = summary.summaryDetail.beta;
-        trailingPE = summary.summaryDetail.trailingPE;
-    }
-} catch(e) { /* ignore */ }
-
-        enriched.push({
-          ...p,
-          cours: realPrice,
-          var: changePercent,
-          valeur: p.qty * realPrice,
-          pv: p.qty * realPrice - p.qty * p.pru,
-          pvpct: p.qty * p.pru ? (p.qty * realPrice - p.qty * p.pru) / (p.qty * p.pru) : 0,
-          annualDiv: annualDiv,
-          divYield: divYield,
-          exDivDate: exDivDate,
-          expectedDivAmount: p.qty * annualDiv,
-          beta: beta,
-          trailingPE: trailingPE,
-          sector: detectSector(p.name, p.ticker)
-        });
-      } catch (err) {
-        console.error(`Erreur pour ${p.ticker}:`, err.message);
-        enriched.push(p);
+      
+      // 1. Récupération du cours
+      const priceData = await fetchPrice(p.ticker);
+      let realPrice = p.cours;
+      let changePercent = 0;
+      if (priceData) {
+        realPrice = priceData.price;
+        changePercent = priceData.changePercent;
       }
-      await new Promise(r => setTimeout(r, 150));
+      
+      // 2. Récupération du dividende (Alpha Vantage)
+      const divData = await fetchDividendAlphaVantage(p.ticker);
+      const annualDiv = divData.annualDiv || 0;
+      const exDivDate = divData.exDivDate || null;
+      const divYield = realPrice ? annualDiv / realPrice : 0;
+      
+      enriched.push({
+        ...p,
+        cours: realPrice,
+        var: changePercent,
+        valeur: p.qty * realPrice,
+        pv: p.qty * realPrice - p.qty * p.pru,
+        pvpct: p.qty * p.pru ? (p.qty * realPrice - p.qty * p.pru) / (p.qty * p.pru) : 0,
+        annualDiv: annualDiv,
+        divYield: divYield,
+        exDivDate: exDivDate,
+        expectedDivAmount: p.qty * annualDiv,
+        beta: priceData?.beta || null,
+        trailingPE: priceData?.trailingPE || null,
+        sector: detectSector(p.name, p.ticker)
+      });
+      
+      // Respecter le rate limit d'Alpha Vantage (5 appels/minute)
+      await new Promise(r => setTimeout(r, 12000)); // 12 secondes = 5 par minute
     }
 
     res.json({ success: true, portfolio: enriched });
