@@ -1,7 +1,8 @@
 const express = require('express');
 const multer = require('multer');
 const XLSX = require('xlsx');
-const yahooFinance = require('yahoo-finance2').default;
+const YahooFinance = require('yahoo-finance2');
+const yahooFinance = new YahooFinance();
 const path = require('path');
 
 const app = express();
@@ -112,17 +113,18 @@ app.post('/upload', upload.single('excel'), async (req, res) => {
         const changePercent = prevClose ? (realPrice - prevClose) / prevClose : 0;
 
         // Récupération des infos supplémentaires (dividendes, etc.)
-        let annualDiv = 0, exDivDate = null, divYield = 0, beta = null, trailingPE = null;
-        try {
-          const summary = await yahooFinance.quoteSummary(fullTicker, { modules: ['summaryDetail', 'defaultKeyStatistics'] });
-          if (summary.summaryDetail) {
-            annualDiv = summary.summaryDetail.trailingAnnualDividendRate || 0;
-            exDivDate = summary.summaryDetail.exDividendDate ? new Date(summary.summaryDetail.exDividendDate * 1000).toISOString().slice(0,10) : null;
-            divYield = summary.summaryDetail.dividendYield || (annualDiv && realPrice ? annualDiv / realPrice : 0);
-            beta = summary.summaryDetail.beta;
-            trailingPE = summary.summaryDetail.trailingPE;
-          }
-        } catch(e) { /* ignore */ }
+let annualDiv = 0, exDivDate = null, divYield = 0, beta = null, trailingPE = null;
+try {
+    // Récupère les modules nécessaires
+    const summary = await yahooFinance.quoteSummary(fullTicker, { modules: ['summaryDetail', 'defaultKeyStatistics'] });
+    if (summary.summaryDetail) {
+        annualDiv = summary.summaryDetail.trailingAnnualDividendRate || 0;
+        exDivDate = summary.summaryDetail.exDividendDate ? new Date(summary.summaryDetail.exDividendDate * 1000).toISOString().slice(0,10) : null;
+        divYield = summary.summaryDetail.dividendYield || (annualDiv && realPrice ? annualDiv / realPrice : 0);
+        beta = summary.summaryDetail.beta;
+        trailingPE = summary.summaryDetail.trailingPE;
+    }
+} catch(e) { /* ignore */ }
 
         enriched.push({
           ...p,
